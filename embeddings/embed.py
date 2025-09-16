@@ -240,6 +240,68 @@ class ArgoEmbeddingsGenerator:
             logger.error(f"Error processing float embeddings: {e}")
             return []
     
+    def process_and_store_chromadb_embeddings(self, floats_df: pd.DataFrame, chromadb_handler) -> bool:
+        """
+        Process floats DataFrame and store embeddings directly in ChromaDB.
+        
+        Args:
+            floats_df: DataFrame containing float metadata
+            chromadb_handler: ChromaDB handler instance
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if floats_df.empty:
+                logger.warning("No float data to process for ChromaDB embeddings")
+                return False
+            
+            # Generate metadata summaries
+            summaries = []
+            metadatas = []
+            ids = []
+            
+            for _, row in floats_df.iterrows():
+                float_dict = row.to_dict()
+                summary = self.generate_float_metadata_summary(float_dict)
+                summaries.append(summary)
+                
+                # Create metadata for ChromaDB
+                metadata = {
+                    'float_id': str(float_dict.get('float_id', 'unknown')),
+                    'latitude': float(float_dict.get('latitude', 0.0)) if pd.notna(float_dict.get('latitude')) else 0.0,
+                    'longitude': float(float_dict.get('longitude', 0.0)) if pd.notna(float_dict.get('longitude')) else 0.0,
+                    'timestamp': str(float_dict.get('time', '')),
+                    'cycle_number': int(float_dict.get('cycle_number', 0)) if pd.notna(float_dict.get('cycle_number')) else 0,
+                    'created_at': datetime.utcnow().isoformat()
+                }
+                metadatas.append(metadata)
+                
+                # Create unique ID for ChromaDB
+                float_id = str(float_dict.get('float_id', 'unknown'))
+                cycle = str(float_dict.get('cycle_number', 0))
+                unique_id = f"{float_id}_{cycle}_{len(ids)}"
+                ids.append(unique_id)
+            
+            # Generate embeddings
+            embeddings = self.generate_embeddings(summaries)
+            embeddings_list = [embedding.tolist() for embedding in embeddings]
+            
+            # Store in ChromaDB
+            chromadb_handler.add_embeddings(
+                embeddings=embeddings_list,
+                documents=summaries,
+                metadatas=metadatas,
+                ids=ids
+            )
+            
+            logger.info(f"Successfully stored {len(embeddings_list)} embeddings in ChromaDB")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error processing and storing ChromaDB embeddings: {e}")
+            return False
+    
     def generate_profile_summaries(self, profiles_df: pd.DataFrame) -> List[str]:
         """
         Generate summaries for profile data (for future use).

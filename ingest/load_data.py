@@ -274,8 +274,22 @@ class ArgoDataLoader:
                     # Already string, just ensure proper format
                     extracted_data["float_id"] = np.array([str(fid).strip() for fid in float_ids.flat]).reshape(float_ids.shape)
                 else:
-                    # Convert numbers to strings
-                    extracted_data["float_id"] = np.array([str(int(fid)) if not np.isnan(fid) else 'unknown' for fid in float_ids.flat]).reshape(float_ids.shape)
+                    # Convert numbers to strings with safe NaN checking
+                    def safe_convert_to_string(value):
+                        try:
+                            # For numeric types, check if it's NaN or a valid number
+                            if isinstance(value, (int, float, np.integer, np.floating)):
+                                if np.isnan(value):
+                                    return 'unknown'
+                                else:
+                                    return str(int(value))
+                            else:
+                                # For other types (strings, objects), convert directly
+                                return str(value).strip()
+                        except (ValueError, TypeError, OverflowError):
+                            return 'unknown'
+                    
+                    extracted_data["float_id"] = np.array([safe_convert_to_string(fid) for fid in float_ids.flat]).reshape(float_ids.shape)
             
             # Log extraction summary
             for field, data in extracted_data.items():

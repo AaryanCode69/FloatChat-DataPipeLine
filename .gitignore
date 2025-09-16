@@ -62,6 +62,12 @@ pipeline.log
 # *.nc
 # *.netcdf
 
+# Data directories - exclude large datasets
+2019/
+argo_data/
+argo_data_2020_01/
+data/
+
 # Cache directories
 __pycache__/
 .pytest_cache/

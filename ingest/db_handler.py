@@ -1,6 +1,6 @@
 """
 Database handler for FloatChat Argo data pipeline.
-Manages connections to Supabase PostgreSQL and handles data operations.
+Manages connections to Supabase PostgreSQL for structured data and ChromaDB for vector embeddings.
 """
 
 import os
@@ -12,6 +12,8 @@ from sqlalchemy import create_engine, text, MetaData, Table
 from sqlalchemy.exc import SQLAlchemyError
 import psycopg2
 from datetime import datetime
+import chromadb
+from chromadb.config import Settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -317,11 +319,206 @@ class SupabaseHandler:
             logger.error(f"Error getting profile count: {e}")
             return 0
     
+    def get_table_counts(self) -> Dict[str, int]:
+        """Get row counts for all main tables."""
+        try:
+            with self.engine.connect() as conn:
+                floats_count = conn.execute(text("SELECT COUNT(*) FROM floats")).fetchone()[0]
+                profiles_count = conn.execute(text("SELECT COUNT(*) FROM profiles")).fetchone()[0]
+                
+                return {
+                    "floats": floats_count,
+                    "profiles": profiles_count
+                }
+                
+        except Exception as e:
+            logger.error(f"Error getting table counts: {e}")
+            return {"floats": 0, "profiles": 0}
+    
     def close(self):
         """Close database connections."""
         if self.engine:
             self.engine.dispose()
         logger.info("Database connections closed")
+
+
+class ChromaDBHandler:
+    """Handles ChromaDB operations for vector embeddings and semantic search."""
+    
+    def __init__(self, host: str = "localhost", port: int = 8000):
+        """
+        Initialize ChromaDB connection.
+        
+        Args:
+            host: ChromaDB host (default: localhost)
+            port: ChromaDB port (default: 8000)
+        """
+        self.host = host or os.getenv("CHROMADB_HOST", "localhost")
+        self.port = int(port or os.getenv("CHROMADB_PORT", "8000"))
+        self.client = None
+        self.collection = None
+        self._connect()
+    
+    def _connect(self):
+        """Establish connection to ChromaDB."""
+        try:
+            # Connect to ChromaDB server
+            self.client = chromadb.HttpClient(
+                host=self.host,
+                port=self.port,
+                settings=Settings(allow_reset=True)
+            )
+            
+            # Test connection
+            self.client.heartbeat()
+            logger.info(f"Successfully connected to ChromaDB at {self.host}:{self.port}")
+            
+            # Get or create collection for Argo data
+            collection_name = "argo_float_data"
+            try:
+                self.collection = self.client.get_collection(name=collection_name)
+                logger.info(f"Using existing collection: {collection_name}")
+            except Exception:
+                # Collection doesn't exist, create it
+                self.collection = self.client.create_collection(
+                    name=collection_name,
+                    metadata={"description": "Argo oceanographic float data embeddings"}
+                )
+                logger.info(f"Created new collection: {collection_name}")
+                
+        except Exception as e:
+            logger.error(f"Failed to connect to ChromaDB: {e}")
+            raise
+    
+    def add_embeddings(self, 
+                      embeddings: List[List[float]], 
+                      documents: List[str], 
+                      metadatas: List[Dict[str, Any]], 
+                      ids: List[str]):
+        """
+        Add embeddings to ChromaDB collection.
+        
+        Args:
+            embeddings: List of embedding vectors
+            documents: List of text documents
+            metadatas: List of metadata dictionaries
+            ids: List of unique identifiers
+        """
+        try:
+            self.collection.add(
+                embeddings=embeddings,
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
+            )
+            logger.info(f"Added {len(embeddings)} embeddings to ChromaDB")
+            
+        except Exception as e:
+            logger.error(f"Error adding embeddings to ChromaDB: {e}")
+            raise
+    
+    def query_embeddings(self, 
+                        query_embeddings: List[List[float]], 
+                        n_results: int = 10,
+                        where: Dict[str, Any] = None):
+        """
+        Query embeddings from ChromaDB.
+        
+        Args:
+            query_embeddings: Query embedding vectors
+            n_results: Number of results to return
+            where: Metadata filter conditions
+            
+        Returns:
+            Query results from ChromaDB
+        """
+        try:
+            results = self.collection.query(
+                query_embeddings=query_embeddings,
+                n_results=n_results,
+                where=where
+            )
+            logger.info(f"Retrieved {len(results['ids'][0]) if results['ids'] else 0} results from ChromaDB")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error querying ChromaDB: {e}")
+            raise
+    
+    def get_collection_info(self):
+        """Get information about the ChromaDB collection."""
+        try:
+            count = self.collection.count()
+            return {
+                "name": self.collection.name,
+                "count": count,
+                "metadata": self.collection.metadata
+            }
+        except Exception as e:
+            logger.error(f"Error getting collection info: {e}")
+            return {}
+    
+    def close(self):
+        """Close ChromaDB connections."""
+        # ChromaDB HttpClient doesn't need explicit closing
+        logger.info("ChromaDB connections closed")
+
+
+class HybridDatabaseHandler:
+    """
+    Hybrid handler that manages both Supabase (structured data) and ChromaDB (vector embeddings).
+    """
+    
+    def __init__(self, 
+                 supabase_config: Dict[str, str] = None,
+                 chromadb_config: Dict[str, Any] = None):
+        """
+        Initialize hybrid database handler.
+        
+        Args:
+            supabase_config: Supabase connection configuration
+            chromadb_config: ChromaDB connection configuration
+        """
+        # Initialize Supabase handler
+        if supabase_config:
+            self.supabase = SupabaseHandler(**supabase_config)
+        else:
+            self.supabase = SupabaseHandler()
+        
+        # Initialize ChromaDB handler
+        if chromadb_config:
+            self.chromadb = ChromaDBHandler(**chromadb_config)
+        else:
+            self.chromadb = ChromaDBHandler()
+    
+    def store_structured_data(self, float_data: pd.DataFrame, profile_data: pd.DataFrame):
+        """Store structured data in Supabase."""
+        return self.supabase.insert_argo_data(float_data, profile_data)
+    
+    def store_embeddings(self, embeddings: List[List[float]], documents: List[str], 
+                        metadatas: List[Dict[str, Any]], ids: List[str]):
+        """Store vector embeddings in ChromaDB."""
+        return self.chromadb.add_embeddings(embeddings, documents, metadatas, ids)
+    
+    def query_similar_data(self, query_embeddings: List[List[float]], 
+                          n_results: int = 10, where: Dict[str, Any] = None):
+        """Query similar data using vector embeddings."""
+        return self.chromadb.query_embeddings(query_embeddings, n_results, where)
+    
+    def get_database_stats(self):
+        """Get statistics from both databases."""
+        supabase_stats = self.supabase.get_table_counts()
+        chromadb_stats = self.chromadb.get_collection_info()
+        
+        return {
+            "supabase": supabase_stats,
+            "chromadb": chromadb_stats
+        }
+    
+    def close(self):
+        """Close all database connections."""
+        self.supabase.close()
+        self.chromadb.close()
 
 
 def create_db_handler() -> SupabaseHandler:
@@ -334,13 +531,50 @@ def create_db_handler() -> SupabaseHandler:
     return SupabaseHandler()
 
 
+def create_hybrid_db_handler() -> HybridDatabaseHandler:
+    """
+    Factory function to create a hybrid database handler with environment variables.
+    
+    Returns:
+        HybridDatabaseHandler: Configured hybrid database handler
+    """
+    return HybridDatabaseHandler()
+
+
 if __name__ == "__main__":
-    # Test the database handler
+    # Load environment variables
+    import os
+    from pathlib import Path
     try:
+        from dotenv import load_dotenv
+        env_file = Path(__file__).parent.parent / '.env'
+        if env_file.exists():
+            load_dotenv(env_file)
+            print(f"Loaded environment variables from: {env_file}")
+    except ImportError:
+        print("dotenv not available, using system environment variables")
+    
+    # Test the database handlers
+    try:
+        print("Testing Supabase handler...")
         db = create_db_handler()
         db.initialize_schema()
-        print("Database handler test successful!")
+        print("✓ Supabase handler test successful!")
         db.close()
+        
+        print("\nTesting ChromaDB handler...")
+        chroma = ChromaDBHandler()
+        info = chroma.get_collection_info()
+        print(f"✓ ChromaDB handler test successful! Collection: {info}")
+        chroma.close()
+        
+        print("\nTesting Hybrid handler...")
+        hybrid = create_hybrid_db_handler()
+        stats = hybrid.get_database_stats()
+        print(f"✓ Hybrid handler test successful! Stats: {stats}")
+        hybrid.close()
         
     except Exception as e:
         print(f"Database handler test failed: {e}")
+        import traceback
+        traceback.print_exc()

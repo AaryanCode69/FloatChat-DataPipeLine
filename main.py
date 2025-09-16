@@ -56,7 +56,7 @@ sys.path.insert(0, str(project_root))
 # Import our modules
 from ingest.load_data import create_data_loader
 from ingest.preprocess import create_preprocessor
-from ingest.db_handler import create_db_handler
+from ingest.db_handler import create_db_handler, create_hybrid_db_handler
 from embeddings.embed import create_embeddings_generator
 
 # Configure logging
@@ -111,9 +111,15 @@ class FloatChatPipeline:
             self.preprocessor = create_preprocessor()
             logger.info("Preprocessor initialized")
             
-            # Initialize database handler
-            self.db_handler = create_db_handler()
-            logger.info("Database handler initialized")
+            # Initialize hybrid database handler (Supabase + ChromaDB)
+            try:
+                self.db_handler = create_hybrid_db_handler()
+                logger.info("Hybrid database handler initialized (Supabase + ChromaDB)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize hybrid handler: {e}")
+                logger.info("Falling back to Supabase-only handler")
+                self.db_handler = create_db_handler()
+                logger.info("Supabase database handler initialized")
             
             # Initialize embeddings generator if enabled
             if self.enable_embeddings:
@@ -142,7 +148,9 @@ class FloatChatPipeline:
                 schema_path = Path(__file__).parent.parent / "ingest" / "schema.sql"
             
             if schema_path.exists():
-                self.db_handler.initialize_schema(str(schema_path))
+                # Initialize schema (use Supabase for structured data)
+                db_schema = self.db_handler.supabase if hasattr(self.db_handler, 'supabase') else self.db_handler
+                db_schema.initialize_schema(str(schema_path))
                 logger.info("Database schema initialized successfully")
             else:
                 logger.error("Could not find schema.sql file")
@@ -262,19 +270,21 @@ class FloatChatPipeline:
             for _, row in floats_df.iterrows():
                 float_id = row['float_id']
                 
-                # Check if float already exists
-                if skip_existing and self.db_handler.check_float_exists(float_id):
+                # Check if float already exists (use Supabase for structured data)
+                db_check = self.db_handler.supabase if hasattr(self.db_handler, 'supabase') else self.db_handler
+                if skip_existing and db_check.check_float_exists(float_id):
                     logger.info(f"Skipping existing float: {float_id}")
                     continue
                 
-                # Insert float data
+                # Insert float data (use Supabase for structured data)
                 float_data = row.to_dict()
                 # Convert properties to dict if it's not already
                 if isinstance(float_data.get('properties'), str):
                     import json
                     float_data['properties'] = json.loads(float_data['properties'])
                 
-                if self.db_handler.insert_float_data(float_data):
+                db_insert = self.db_handler.supabase if hasattr(self.db_handler, 'supabase') else self.db_handler
+                if db_insert.insert_float_data(float_data):
                     success_count += 1
                 else:
                     logger.warning(f"Failed to insert float: {float_id}")
@@ -292,8 +302,9 @@ class FloatChatPipeline:
             if profiles_df.empty:
                 return True
             
-            # Use bulk insert for better performance
-            success = self.db_handler.bulk_insert_profiles(profiles_df)
+            # Use bulk insert for better performance (use Supabase for structured data)
+            db_insert = self.db_handler.supabase if hasattr(self.db_handler, 'supabase') else self.db_handler
+            success = db_insert.bulk_insert_profiles(profiles_df)
             
             if success:
                 logger.info(f"Successfully inserted {len(profiles_df)} profiles")
@@ -312,18 +323,39 @@ class FloatChatPipeline:
             if not self.embeddings_generator:
                 return True
             
-            # Generate embeddings
+            # Check if we have ChromaDB available (hybrid handler)
+            if hasattr(self.db_handler, 'chromadb'):
+                # Use ChromaDB for embeddings storage
+                logger.info("Storing embeddings in ChromaDB")
+                success = self.embeddings_generator.process_and_store_chromadb_embeddings(
+                    floats_df, self.db_handler.chromadb
+                )
+                if success:
+                    logger.info("Successfully stored embeddings in ChromaDB")
+                    return True
+                else:
+                    logger.warning("Failed to store embeddings in ChromaDB, falling back to traditional method")
+            
+            # Fallback to traditional embedding storage (Supabase)
+            logger.info("Using traditional embedding storage method")
             embedding_records = self.embeddings_generator.process_float_embeddings(floats_df)
             
             if not embedding_records:
                 logger.warning("No embeddings generated")
                 return True
             
-            # Insert embeddings
+            # Insert embeddings using traditional method
             success_count = 0
-            for record in embedding_records:
-                if self.db_handler.insert_embedding_data(record):
-                    success_count += 1
+            if hasattr(self.db_handler, 'supabase'):
+                # Hybrid handler
+                for record in embedding_records:
+                    if self.db_handler.supabase.insert_embedding_data(record):
+                        success_count += 1
+            else:
+                # Traditional handler
+                for record in embedding_records:
+                    if self.db_handler.insert_embedding_data(record):
+                        success_count += 1
             
             logger.info(f"Successfully inserted {success_count}/{len(embedding_records)} embeddings")
             return success_count > 0

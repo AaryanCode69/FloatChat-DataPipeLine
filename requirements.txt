@@ -1,0 +1,13 @@
+xarray
+netCDF4
+pandas
+numpy
+psycopg2-binary
+SQLAlchemy
+tqdm
+sentence-transformers
+chromadb
+python-dotenv
+supabase
+requests
+aiohttp

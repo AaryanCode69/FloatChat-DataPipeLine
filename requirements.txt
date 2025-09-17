@@ -11,3 +11,9 @@ python-dotenv
 supabase
 requests
 aiohttp
+
+# FastAPI dependencies
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles

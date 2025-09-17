@@ -68,13 +68,19 @@ class SupabaseHandler:
             
             logger.info(f"Attempting to connect to: postgresql://{self.db_user}:***@{db_host}:{db_port}/{self.db_name}")
             
-            # Create SQLAlchemy engine
+            # Create SQLAlchemy engine with improved connection settings
             self.engine = create_engine(
                 db_url,
-                pool_size=10,
-                max_overflow=20,
+                pool_size=5,
+                max_overflow=10,
                 pool_timeout=30,
-                pool_recycle=3600
+                pool_recycle=1800,  # Recycle connections every 30 minutes
+                pool_pre_ping=True,  # Validate connections before use
+                echo=False,
+                connect_args={
+                    'connect_timeout': 10,
+                    'application_name': 'FloatChat-Pipeline'
+                }
             )
             
             # Test connection
@@ -127,50 +133,89 @@ class SupabaseHandler:
             logger.error(f"Error initializing schema: {e}")
             raise
     
-    def insert_float_data(self, float_data: Dict[str, Any]) -> bool:
+    def insert_float_data(self, float_data: Dict[str, Any], retry_count: int = 3) -> bool:
         """
-        Insert float metadata into the floats table.
+        Insert float metadata into the floats table with retry logic.
         
         Args:
             float_data: Dictionary containing float information
+            retry_count: Number of retry attempts
             
         Returns:
             bool: Success status
         """
-        try:
-            with self.engine.connect() as conn:
-                # Convert properties dict to JSON string if needed
-                properties = float_data.get('properties', {})
-                if isinstance(properties, dict):
-                    import json
-                    properties_json = json.dumps(properties)
+        for attempt in range(retry_count):
+            try:
+                # Recreate connection if needed
+                if self.engine is None:
+                    logger.warning("Engine is None, reconnecting...")
+                    self._connect()
+                
+                # Test connection before using it
+                try:
+                    with self.engine.connect() as test_conn:
+                        test_conn.execute(text("SELECT 1"))
+                        test_conn.commit()
+                except Exception as conn_test_error:
+                    logger.warning(f"Connection test failed (attempt {attempt + 1}): {conn_test_error}")
+                    if attempt < retry_count - 1:
+                        # Recreate the engine and try again
+                        self.engine.dispose()
+                        self._connect()
+                        continue
+                    else:
+                        raise conn_test_error
+                
+                # Proceed with the insert operation
+                with self.engine.connect() as conn:
+                    # Convert properties dict to JSON string if needed
+                    properties = float_data.get('properties', {})
+                    if isinstance(properties, dict):
+                        import json
+                        properties_json = json.dumps(properties)
+                    else:
+                        properties_json = properties
+                    
+                    # Insert query
+                    query = text("""
+                        INSERT INTO floats (float_id, platform_number, deploy_date, properties)
+                        VALUES (:float_id, :platform_number, :deploy_date, :properties)
+                        ON CONFLICT (float_id) DO UPDATE SET
+                            platform_number = EXCLUDED.platform_number,
+                            deploy_date = EXCLUDED.deploy_date,
+                            properties = EXCLUDED.properties
+                    """)
+                    
+                    result = conn.execute(query, {
+                        'float_id': float_data.get('float_id'),
+                        'platform_number': float_data.get('platform_number'),
+                        'deploy_date': float_data.get('deploy_date'),
+                        'properties': properties_json
+                    })
+                    conn.commit()
+                    
+                    logger.info(f"Successfully inserted float: {float_data.get('float_id')}")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error inserting float data (attempt {attempt + 1}/{retry_count}): {e}")
+                
+                # If this is not the last attempt, try to reconnect
+                if attempt < retry_count - 1:
+                    logger.info(f"Retrying in attempt {attempt + 2}...")
+                    try:
+                        if self.engine:
+                            self.engine.dispose()
+                        self._connect()
+                    except Exception as reconnect_error:
+                        logger.error(f"Failed to reconnect: {reconnect_error}")
+                        continue
                 else:
-                    properties_json = properties
-                
-                # Insert query
-                query = text("""
-                    INSERT INTO floats (float_id, platform_number, deploy_date, properties)
-                    VALUES (:float_id, :platform_number, :deploy_date, :properties)
-                    ON CONFLICT (float_id) DO UPDATE SET
-                        platform_number = EXCLUDED.platform_number,
-                        deploy_date = EXCLUDED.deploy_date,
-                        properties = EXCLUDED.properties
-                """)
-                
-                conn.execute(query, {
-                    'float_id': float_data.get('float_id'),
-                    'platform_number': float_data.get('platform_number'),
-                    'deploy_date': float_data.get('deploy_date'),
-                    'properties': properties_json
-                })
-                conn.commit()
-                
-                logger.info(f"Successfully inserted float: {float_data.get('float_id')}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error inserting float data: {e}")
-            return False
+                    # This was the last attempt, return False
+                    logger.error(f"Failed to insert float data after {retry_count} attempts")
+                    return False
+        
+        return False
     
     def insert_profile_data(self, profile_data: List[Dict[str, Any]]) -> bool:
         """
